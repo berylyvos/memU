@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -10,6 +11,7 @@ from typing import Any, cast
 import httpx
 
 from memu.llm.backends.base import LLMBackend
+from memu.utils.trace import trace_id as _trace_id
 from memu.llm.backends.doubao import DoubaoLLMBackend
 from memu.llm.backends.grok import GrokBackend
 from memu.llm.backends.openai import OpenAILLMBackend
@@ -138,10 +140,13 @@ class HTTPLLMClient:
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
 
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout) as client:
             resp = await client.post(self.summary_endpoint, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
+        elapsed = time.perf_counter() - t0
+        logger.info("trace=%s llm=chat model=%s elapsed=%.3fs", _trace_id.get(), self.chat_model, elapsed)
         logger.debug("HTTP LLM chat response: %s", data)
         return self.backend.parse_summary_response(data), data
 
@@ -151,10 +156,13 @@ class HTTPLLMClient:
         payload = self.backend.build_summary_payload(
             text=text, system_prompt=system_prompt, chat_model=self.chat_model, max_tokens=max_tokens
         )
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, proxy=self.proxy) as client:
             resp = await client.post(self.summary_endpoint, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
+        elapsed = time.perf_counter() - t0
+        logger.info("trace=%s llm=summarize model=%s elapsed=%.3fs", _trace_id.get(), self.chat_model, elapsed)
         logger.debug("HTTP LLM summarize response: %s", data)
         return self.backend.parse_summary_response(data), data
 
@@ -201,20 +209,29 @@ class HTTPLLMClient:
             max_tokens=max_tokens,
         )
 
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, proxy=self.proxy) as client:
             resp = await client.post(self.summary_endpoint, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
+        elapsed = time.perf_counter() - t0
+        logger.info("trace=%s llm=vision model=%s elapsed=%.3fs", _trace_id.get(), self.chat_model, elapsed)
         logger.debug("HTTP LLM vision response: %s", data)
         return self.backend.parse_summary_response(data), data
 
     async def embed(self, inputs: list[str]) -> tuple[list[list[float]], dict[str, Any]]:
         """Create text embeddings using the provider-specific embedding API."""
         payload = self.embedding_backend.build_embedding_payload(inputs=inputs, embed_model=self.embed_model)
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, proxy=self.proxy) as client:
             resp = await client.post(self.embedding_endpoint, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "trace=%s llm=embed model=%s n=%d elapsed=%.3fs",
+            _trace_id.get(), self.embed_model, len(inputs), elapsed,
+        )
         logger.debug("HTTP embedding response: %s", data)
         return self.embedding_backend.parse_embedding_response(data), data
 
@@ -252,6 +269,7 @@ class HTTPLLMClient:
                 if language:
                     data["language"] = language
 
+                t0 = time.perf_counter()
                 async with httpx.AsyncClient(
                     base_url=self.base_url, timeout=self.timeout * 3, proxy=self.proxy
                 ) as client:
@@ -268,6 +286,8 @@ class HTTPLLMClient:
                     else:
                         raw_response = resp.json()
                         result = raw_response.get("text", "")
+                elapsed = time.perf_counter() - t0
+                logger.info("trace=%s llm=transcribe elapsed=%.3fs", _trace_id.get(), elapsed)
 
             logger.debug("HTTP audio transcribe response for %s: %s chars", audio_path, len(result))
         except Exception:

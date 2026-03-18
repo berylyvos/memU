@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import inspect
+import logging
+import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from memu.utils.trace import trace_id as _trace_id
+
 if TYPE_CHECKING:
     from memu.workflow.interceptor import WorkflowInterceptorRegistry
+
+logger = logging.getLogger(__name__)
 
 WorkflowState = dict[str, Any]
 WorkflowContext = Mapping[str, Any] | None
@@ -61,10 +68,17 @@ async def run_steps(
         run_on_error_interceptors,
     )
 
+    # Assign a trace ID for this workflow run if not already set (supports nested calls)
+    trace_id = _trace_id.get()
+    if not trace_id:
+        trace_id = uuid.uuid4().hex[:8]
+        _trace_id.set(trace_id)
+
     snapshot = interceptor_registry.snapshot() if interceptor_registry else None
     strict = interceptor_registry.strict if interceptor_registry else False
 
     state = dict(initial_state)
+    workflow_start = time.perf_counter()
     for step in steps:
         missing = step.requires - state.keys()
         if missing:
@@ -88,7 +102,13 @@ async def run_steps(
             await run_before_interceptors(snapshot.before, interceptor_ctx, state, strict=strict)
 
         try:
+            t0 = time.perf_counter()
             state = await step.run(state, step_context)
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                "trace=%s workflow=%s step=%s elapsed=%.3fs",
+                trace_id, name, step.step_id, elapsed,
+            )
         except Exception as e:
             if snapshot and snapshot.on_error:
                 await run_on_error_interceptors(snapshot.on_error, interceptor_ctx, state, e, strict=strict)
@@ -98,4 +118,6 @@ async def run_steps(
         if snapshot and snapshot.after:
             await run_after_interceptors(snapshot.after, interceptor_ctx, state, strict=strict)
 
+    total = time.perf_counter() - workflow_start
+    logger.info("trace=%s workflow=%s total_elapsed=%.3fs", trace_id, name, total)
     return state

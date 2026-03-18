@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from typing import Literal
 
@@ -10,6 +11,7 @@ import httpx
 from memu.embedding.backends.base import EmbeddingBackend
 from memu.embedding.backends.doubao import DoubaoEmbeddingBackend, DoubaoMultimodalEmbeddingInput
 from memu.embedding.backends.openai import OpenAIEmbeddingBackend
+from memu.utils.trace import trace_id as _trace_id
 
 
 def _load_proxy() -> str | None:
@@ -68,10 +70,16 @@ class HTTPEmbeddingClient:
             List of embedding vectors
         """
         payload = self.backend.build_embedding_payload(inputs=inputs, embed_model=self.embed_model)
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, proxy=self.proxy) as client:
             resp = await client.post(self.embedding_endpoint, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "trace=%s embedding=embed model=%s n=%d elapsed=%.3fs",
+            _trace_id.get(), self.embed_model, len(inputs), elapsed,
+        )
         logger.debug("HTTP embedding response: %s", data)
         return self.backend.parse_embedding_response(data)
 
@@ -130,11 +138,16 @@ class HTTPEmbeddingClient:
         )
 
         endpoint = self.backend.multimodal_embedding_endpoint.lstrip("/")
+        t0 = time.perf_counter()
         async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout, proxy=self.proxy) as client:
             resp = await client.post(endpoint, json=payload, headers=self._headers())
             resp.raise_for_status()
             data = resp.json()
-
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "trace=%s embedding=embed_multimodal model=%s n=%d elapsed=%.3fs",
+            _trace_id.get(), self.embed_model, len(inputs), elapsed,
+        )
         logger.debug("HTTP multimodal embedding response: %s", data)
         return self.backend.parse_multimodal_embedding_response(data)
 
