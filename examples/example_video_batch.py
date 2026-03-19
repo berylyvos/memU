@@ -105,45 +105,44 @@ class TraceCollector:
     """Thread-safe collector for workflow step and LLM call traces."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._records_lock = threading.Lock()   # guards llm_records, step_records, _step_starts
+        self._file_lock = threading.Lock()      # guards _task_file only
         self.llm_records: list[LLMTraceRecord] = []
         self.step_records: list[StepTraceRecord] = []
-        # per-step wall-clock start times keyed by (file, step_id)
         self._step_starts: dict[tuple[str, str], float] = {}
-        # current file being processed per asyncio task (task_id -> filename)
         self._task_file: dict[int, str] = {}
 
-    # -- file tracking -------------------------------------------------------
+    # -- file tracking (uses _file_lock only) --------------------------------
 
     def set_current_file(self, filename: str) -> None:
         tid = id(asyncio.current_task())
-        with self._lock:
+        with self._file_lock:
             self._task_file[tid] = filename
 
     def current_file(self) -> str:
         tid = id(asyncio.current_task())
-        with self._lock:
+        with self._file_lock:
             return self._task_file.get(tid, "-")
 
     def clear_current_file(self) -> None:
         tid = id(asyncio.current_task())
-        with self._lock:
+        with self._file_lock:
             self._task_file.pop(tid, None)
 
-    # -- workflow step -------------------------------------------------------
+    # -- workflow step (uses _records_lock only) ------------------------------
 
     def on_step_before(self, step_ctx: Any, state: Any) -> None:
-        key = (self.current_file(), step_ctx.step_id)
-        with self._lock:
+        fname = self.current_file()
+        key = (fname, step_ctx.step_id)
+        with self._records_lock:
             self._step_starts[key] = time.monotonic()
 
     def on_step_after(self, step_ctx: Any, state: Any) -> None:
         fname = self.current_file()
         key = (fname, step_ctx.step_id)
-        with self._lock:
+        with self._records_lock:
             t0 = self._step_starts.pop(key, None)
-        elapsed_ms = (time.monotonic() - t0) * 1000 if t0 else 0.0
-        with self._lock:
+            elapsed_ms = (time.monotonic() - t0) * 1000 if t0 else 0.0
             self.step_records.append(StepTraceRecord(
                 file=fname,
                 step_id=step_ctx.step_id,
@@ -155,10 +154,9 @@ class TraceCollector:
     def on_step_error(self, step_ctx: Any, state: Any, error: Exception) -> None:
         fname = self.current_file()
         key = (fname, step_ctx.step_id)
-        with self._lock:
+        with self._records_lock:
             t0 = self._step_starts.pop(key, None)
-        elapsed_ms = (time.monotonic() - t0) * 1000 if t0 else 0.0
-        with self._lock:
+            elapsed_ms = (time.monotonic() - t0) * 1000 if t0 else 0.0
             self.step_records.append(StepTraceRecord(
                 file=fname,
                 step_id=step_ctx.step_id,
@@ -168,12 +166,13 @@ class TraceCollector:
                 error=str(error),
             ))
 
-    # -- LLM calls -----------------------------------------------------------
+    # -- LLM calls (uses _records_lock only) ---------------------------------
 
     def on_llm_after(self, ctx: Any, req: Any, resp: Any, usage: Any) -> None:
-        with self._lock:
+        fname = self.current_file()   # _file_lock, released before _records_lock
+        with self._records_lock:
             self.llm_records.append(LLMTraceRecord(
-                file=self.current_file(),
+                file=fname,
                 step_id=ctx.step_id or "-",
                 kind=req.kind,
                 profile=ctx.profile or "-",
@@ -186,9 +185,10 @@ class TraceCollector:
             ))
 
     def on_llm_error(self, ctx: Any, req: Any, error: Exception, usage: Any) -> None:
-        with self._lock:
+        fname = self.current_file()   # _file_lock, released before _records_lock
+        with self._records_lock:
             self.llm_records.append(LLMTraceRecord(
-                file=self.current_file(),
+                file=fname,
                 step_id=ctx.step_id or "-",
                 kind=req.kind,
                 profile=ctx.profile or "-",
