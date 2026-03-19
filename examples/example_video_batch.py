@@ -30,9 +30,15 @@ from typing import Any
 src_path = os.path.abspath("src")
 sys.path.insert(0, src_path)
 
+from pydantic import BaseModel  # noqa: E402
+
 from memu.app import MemoryService  # noqa: E402
 from memu.llm.wrapper import LLMCallContext, LLMRequestView, LLMResponseView, LLMUsage  # noqa: E402
 from memu.workflow.interceptor import WorkflowStepContext  # noqa: E402
+
+
+class _EmptyUserModel(BaseModel):
+    """Scope model with no fields — avoids SQLite type-mapping issues with Optional fields."""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -438,6 +444,13 @@ async def main(video_dir: Path, concurrency: int, output_dir: Path) -> None:
             },
         },
         memorize_config={"memory_categories": unique_categories},
+        database_config={
+            "metadata_store": {
+                "provider": "sqlite",
+                "dsn": f"sqlite:///{output_dir / 'memu.db'}",
+            }
+        },
+        user_config={"model": _EmptyUserModel},
     )
 
     # 4. Setup tracing
