@@ -331,13 +331,14 @@ def build_unique_categories(tasks: list[VideoTask]) -> list[dict]:
     return list(seen.values())
 
 
-def write_category_md(categories: list[dict], output_dir: Path) -> None:
+def write_category_md(categories: list[dict], output_dir: Path, collector: TraceCollector) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for cat in categories:
         name = cat.get("name", "unknown")
         description = cat.get("description", "")
         summary = cat.get("summary", "")
         filepath = output_dir / f"{name}.md"
+        t0 = time.monotonic()
         with filepath.open("w", encoding="utf-8") as f:
             f.write(f"# {name.replace('_', ' ').title()}\n\n")
             if description:
@@ -347,6 +348,15 @@ def write_category_md(categories: list[dict], output_dir: Path) -> None:
                 f.write(f"{cleaned}\n")
             else:
                 f.write("*No content available*\n")
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        with collector._records_lock:
+            collector.step_records.append(StepTraceRecord(
+                file=name,
+                step_id="write_category_md",
+                step_role="io",
+                elapsed_ms=round(elapsed_ms, 1),
+                status="ok",
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +486,7 @@ async def main(video_dir: Path, concurrency: int, output_dir: Path) -> None:
             stats.errors.append((r.path.name, r.error or "unknown"))
 
     # 6. Write output
-    write_category_md(categories, output_dir)
+    write_category_md(categories, output_dir, collector)
 
     # 7. Write trace reports
     write_trace_report(collector, output_dir)
