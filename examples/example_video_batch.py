@@ -27,12 +27,14 @@ src_path = os.path.abspath("src")
 sys.path.insert(0, src_path)
 
 from memu.app import MemoryService  # noqa: E402
+from memu.llm.wrapper import LLMCallContext, LLMRequestView, LLMResponseView, LLMUsage  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+llm_trace_logger = logging.getLogger("memu.llm.trace")
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +66,51 @@ class BatchStats:
     total_items: int = 0
     elapsed: float = 0.0
     errors: list[tuple[str, str]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# LLM / Embedding trace logging
+# ---------------------------------------------------------------------------
+
+def setup_llm_tracing(service: MemoryService) -> None:
+    """Register before/after/on_error interceptors to log every LLM and embedding call."""
+
+    def on_before(ctx: LLMCallContext, req: LLMRequestView) -> None:
+        llm_trace_logger.info(
+            "[LLM] --> kind=%-8s step=%-20s op=%-20s profile=%-10s model=%s  in_items=%s in_chars=%s",
+            req.kind,
+            ctx.step_id or "-",
+            ctx.operation or "-",
+            ctx.profile or "-",
+            ctx.model or "-",
+            req.input_items,
+            req.input_chars,
+        )
+
+    def on_after(ctx: LLMCallContext, req: LLMRequestView, resp: LLMResponseView, usage: LLMUsage) -> None:
+        llm_trace_logger.info(
+            "[LLM] <-- kind=%-8s step=%-20s latency=%6.0fms  tokens(in=%s out=%s total=%s)  out_chars=%s",
+            req.kind,
+            ctx.step_id or "-",
+            usage.latency_ms or 0,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.total_tokens,
+            resp.output_chars,
+        )
+
+    def on_error(ctx: LLMCallContext, req: LLMRequestView, error: Exception, usage: LLMUsage) -> None:
+        llm_trace_logger.error(
+            "[LLM] ERR kind=%-8s step=%-20s latency=%6.0fms  error=%s",
+            req.kind,
+            ctx.step_id or "-",
+            usage.latency_ms or 0,
+            error,
+        )
+
+    service.intercept_before_llm_call(on_before)
+    service.intercept_after_llm_call(on_after)
+    service.intercept_on_error_llm_call(on_error)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +261,10 @@ async def main(video_dir: Path, concurrency: int, output_dir: Path) -> None:
         memorize_config={"memory_categories": unique_categories},
     )
 
-    # 4. Run batch
+    # 4. Setup LLM tracing
+    setup_llm_tracing(service)
+
+    # 5. Run batch
     t0 = time.monotonic()
     results, categories = await run_batch(tasks, service, concurrency)
     total_elapsed = time.monotonic() - t0

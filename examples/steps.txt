@@ -1,0 +1,279 @@
+---                                                                                                                                                                                 
+  example_video_batch.py 全流程拆解                                                                                                                                                   
+                                                                                           
+  一、顶层流程                                                                                                                                                                        
+                                                                                                                                                                                      
+  main(video_dir, concurrency, output_dir)
+  ├── 1. discover_videos()          → list[VideoTask]                                                                                                                                 
+  ├── 2. build_unique_categories()  → list[dict]            
+  ├── 3. MemoryService.__init__()   → service
+  ├── 4. run_batch()                → list[TaskResult], list[dict(category)]
+  ├── 5. 统计 BatchStats
+  ├── 6. write_category_md()        → 每个 category 一个 .md
+  └── 7. 写 results.json
+
+  ---
+  二、启动阶段
+
+  2.1 discover_videos()
+
+  video_dir.glob("**/*.mp4")  →  按文件名排序
+  └── 对每个 mp4:
+      parse_category_from_filename(mp4)
+      ├── mp4.stem = "interview_01.cooking"
+      ├── rsplit(".", 1) → ["interview_01", "cooking"]
+      └── → category_name = "cooking"
+      → VideoTask(path, category_name="cooking", category_description="Videos related to cooking")                                                                                    
+                                                                                                                                                                                      
+  2.2 build_unique_categories()                                                                                                                                                       
+                                                                                                                                                                                      
+  遍历所有 VideoTask，按 category_name 去重                 
+  → [{"name": "cooking", "description": "..."}, {"name": "travel", ...}, ...]
+
+  2.3 MemoryService.init()
+
+  MemoryService(llm_profiles={...}, memorize_config={"memory_categories": unique_categories})
+  ├── 验证 llm_profiles → LLMProfilesConfig
+  │   └── 自动补充 "embedding" profile = "default" profile
+  ├── 构建 category_configs (N个去重后的分类)
+  ├── _format_categories_for_prompt()
+  │   → _category_prompt_str = "- cooking: Videos related to cooking\n- travel: ..."
+  ├── Context(categories_ready=False)   ← 分类向量尚未初始化
+  ├── build_database() → inmemory Database                                                                                                                                            
+  └── _register_pipelines()
+      └── 注册 "memorize" workflow (7个 WorkflowStep)                                                                                                                                 
+                                                            
+  ---                                                                                                                                                                                 
+  三、并发执行阶段                                          
+                                                                                                                                                                                      
+  3.1 run_batch()
+                                                                                                                                                                                      
+  run_batch(tasks, service, concurrency=4)                  
+  ├── semaphore = asyncio.Semaphore(4)
+  ├── coros = [process_one(service, task, semaphore) for task in tasks]
+  │   → 100个协程对象，此时尚未执行
+  └── asyncio.gather(*coros)                                                                                                                                                          
+      → 同时提交所有协程到事件循环                                                                                                                                                    
+      → Semaphore 保证任意时刻最多 4 个并发执行                                                                                                                                       
+      → 所有完成后返回 list[TaskResult]                                                                                                                                               
+                                                                                                                                                                                      
+  3.2 process_one() — 单个视频的执行                        
+
+  async with semaphore:          ← 获取令牌，超出 concurrency 则等待
+      service.memorize(resource_url=str(path), modality="video")
+      → 返回 TaskResult
+
+  ---
+  四、service.memorize() 内部详细流程（video 模态）
+
+  阶段 0：分类初始化（仅第一个拿到锁的协程执行，其余等待）
+
+  memorize()
+  └── _ensure_categories_ready(ctx, store, user_scope)
+      └── ctx.categories_ready == False → _initialize_categories()
+          ├── 对每个 CategoryConfig 生成 embedding text
+          │   "cooking: Videos related to cooking"
+          │   "travel: Videos related to travel"
+          │   ...                                                                                                                                                                     
+          ├── llm_client("embedding").embed([N个文本])
+          │   → N个向量 (并发批量请求)                                                                                                                                                
+          └── 对每个 (cfg, vec):                            
+              store.memory_category_repo.get_or_create_category(name, description, embedding)
+              ctx.category_ids.append(cat.id)
+              ctx.category_name_to_id["cooking"] = cat_id_1
+              ...
+          → ctx.categories_ready = True
+
+  ▎ 并发安全说明：_ensure_categories_ready 检查 ctx.categories_ready，但多个协程可能同时通过检查。由于 asyncio 是单线程事件循环，await 点才会切换，_initialize_categories 内部的 await
+   embed() 之前不会被抢占，所以实际上只有第一个协程会真正执行初始化，后续协程进入时 categories_ready 已为 True。
+                                                                                                                                                                                      
+  ---                                                       
+  Step 1: ingest_resource (io)
+                                                                                                                                                                                      
+  _memorize_ingest_resource()
+  └── fs.fetch("path/to/video.cooking.mp4", "video")                                                                                                                                  
+      → local_path = "/path/to/video.cooking.mp4"  (本地文件直接返回路径)
+      → raw_text = None                              (video 无文本)
+
+  state += {local_path, raw_text=None}
+
+  ---
+  Step 2: preprocess_multimodal (llm)
+
+  _memorize_preprocess_multimodal()
+  └── _preprocess_resource_url(local_path, text=None, modality="video", llm_client)
+      ├── 查找 template = PREPROCESS_PROMPTS["video"]
+      │   → 视频分析的 prompt 模板
+      ├── template 存在，且 modality != "audio"，且不需要 text
+      └── _dispatch_preprocessor(modality="video", ...)
+          └── _preprocess_video(local_path, template, llm_client)
+              ├── VideoFrameExtractor.is_ffmpeg_available()  → 检查 ffmpeg                                                                                                            
+              ├── VideoFrameExtractor.extract_middle_frame(local_path)
+              │   → 用 ffmpeg 提取视频中间帧                                                                                                                                          
+              │   → frame_path = "/tmp/xxxxx.jpg"           
+              ├── llm_client.vision(prompt=template, image_path=frame_path)
+              │   → Vision API (gpt-4o-mini) 分析帧图像
+              │   → 返回 XML: <detailed_description>...</detailed_description>
+              │                <caption>...</caption>
+              ├── _parse_multimodal_response(raw, "detailed_description", "caption")
+              │   → description = "A person cooking pasta in a kitchen..."
+              │   → caption = "Person cooking pasta"
+              └── 清理临时帧文件 frame_path
+
+  state["preprocessed_resources"] = [{"text": description, "caption": caption}]
+
+  ---
+  Step 3: extract_items (llm)
+
+  _memorize_extract_items()
+  └── 对 preprocessed_resources[0] (video 只有1个):
+      res_url = "path/to/video.cooking.mp4"  (total_segments=1，不加 segment 后缀)
+      text = "A person cooking pasta in a kitchen..."
+      caption = "Person cooking pasta"
+
+      _generate_structured_entries(res_url, "video", memory_types, text, categories_prompt_str)                                                                                       
+      └── _generate_text_entries(text, ...)
+          └── _generate_entries_from_text(text, memory_types, categories_prompt_str)                                                                                                  
+              ├── 对每个 memory_type (knowledge/profile/behavior/event/skill):
+              │   _build_memory_type_prompt(mtype, resource_text=description, categories_str)
+              │   → 填充模板，例如 knowledge 类型:
+              │     "从以下内容提取知识类记忆...
+              │      内容: A person cooking pasta...
+              │      可用分类: - cooking: Videos related to cooking
+              │                - travel: ..."
+              │
+              ├── asyncio.gather(*[llm_client.chat(prompt) for prompt in prompts])
+              │   → 并发调用 LLM，每种 memory_type 一次 (5个并发请求)
+              │   → 每个返回 XML:
+              │     <knowledge>
+              │       <memory>
+              │         <content>Pasta requires boiling water before adding noodles</content>
+              │         <categories><category>cooking</category></categories>
+              │       </memory>
+              │     </knowledge>
+              │
+              └── _parse_structured_entries(memory_types, responses)
+                  └── 对每个响应:
+                      _parse_memory_type_response_xml(raw)
+                      → [(MemoryType.knowledge, "Pasta requires...", ["cooking"]),
+                         (MemoryType.behavior, "Chef stirs pot...", ["cooking"]),                                                                                                     
+                         ...]
+                                                                                                                                                                                      
+  state["resource_plans"] = [{                              
+      "resource_url": "video.cooking.mp4",
+      "text": "A person cooking pasta...",
+      "caption": "Person cooking pasta",
+      "entries": [(type, content, [cat_names]), ...]
+  }]
+
+  ---
+  Step 4: dedupe_merge
+
+  _memorize_dedupe_merge()
+  → 当前 placeholder，直接透传
+
+  ---
+  Step 5: categorize_items (db + vector)
+
+  _memorize_categorize_items()
+  └── 对 resource_plans[0]:
+      _create_resource_with_caption(
+          resource_url="video.cooking.mp4",
+          modality="video",
+          local_path="/path/to/video.cooking.mp4",
+          caption="Person cooking pasta",
+          store, embed_client
+      )
+      ├── embed_client.embed(["Person cooking pasta"])  → caption_embedding
+      └── store.resource_repo.create_resource(...)
+          → Resource(id=uuid, url=..., modality="video", caption=..., embedding=...)
+
+      _persist_memory_items(resource_id, entries, ctx, store, embed_client)
+      ├── summary_payloads = ["Pasta requires...", "Chef stirs pot...", ...]
+      ├── embed_client.embed(summary_payloads)
+      │   → 批量生成所有 memory item 的向量 (一次 API 调用)
+      └── 对每个 (memory_type, summary_text, cat_names):
+          ├── store.memory_item_repo.create_item(
+          │       resource_id, memory_type, summary_text, embedding)
+          │   → MemoryItem(id=uuid, ...)
+          ├── _map_category_names_to_ids(["cooking"], ctx)
+          │   → ctx.category_name_to_id["cooking"] → cat_id_cooking
+          └── store.category_item_repo.link_item_category(item.id, cat_id_cooking)
+              category_updates[cat_id_cooking].append((item.id, summary_text))
+
+  state += {resources, items, relations, category_updates}
+
+  ---
+  Step 6: persist_index (db + llm)
+
+  _memorize_persist_and_index()
+  └── _update_category_summaries(category_updates, ctx, store, llm_client)
+      ├── 对每个有新 items 的 category (如 cat_id_cooking):
+      │   cat = store.memory_category_repo.categories[cat_id_cooking]
+      │   _build_category_summary_prompt(cat, new_memories=[(item_id, summary), ...])
+      │   → prompt:
+      │     "已有摘要: {原有摘要或空}
+      │      新增记忆:
+      │      - Pasta requires boiling water...
+      │      - Chef stirs pot regularly...
+      │      请更新 cooking 分类的摘要，目标长度 400 字..."
+      │
+      ├── asyncio.gather(*[llm_client.chat(prompt) for ...])
+      │   → 并发更新所有受影响分类的摘要
+      │
+      └── store.memory_category_repo.update_category(cid, summary=new_summary)
+          → MemoryCategory.summary 被更新（累积，非覆盖）                                                                                                                             
+   
+  ---                                                                                                                                                                                 
+  Step 7: build_response (emit)                             
+
+  _memorize_build_response()
+  └── response = {
+        "resource": {url, modality, caption, ...},
+        "items": [{memory_type, summary, ...}, ...],
+        "categories": [
+            {name:"cooking", description:..., summary:"累积摘要文本"}, ...
+        ],
+        "relations": [{item_id, category_id}, ...]
+      }
+  → memorize() 返回此 dict
+
+  ---
+  五、并发时序图
+
+  时间轴 →
+  协程1 [video_a.cooking.mp4]  ████████████████████████░░░░░░░░
+  协程2 [video_b.cooking.mp4]  ░░░████████████████████████░░░░░
+  协程3 [video_c.travel.mp4]   ░░░░░░████████████████████████░░
+  协程4 [video_d.travel.mp4]   ░░░░░░░░████████████████████████
+  协程5 [video_e.cooking.mp4]  等待semaphore...████████████████
+  ...
+
+  █ = 占用 semaphore slot (Vision API + LLM 调用)
+  ░ = 等待或已完成
+
+  category_updates 写入 inmemory store → 无锁冲突（asyncio 单线程）
+  category summary 更新 → 每次 memorize 结束时独立更新，后写覆盖前写
+                                                                                                                                                                                      
+  ---
+  六、数据流总结                                                                                                                                                                      
+                                                            
+  N个 mp4 文件
+   → [discover] 文件名解析 → VideoTask(path, category_name)
+   → [去重] → M个唯一 category → MemoryService 注册 + embed
+   → [并发 × concurrency]
+       每个文件:
+         [ingest]      → local_path (video 无 raw_text)
+         [preprocess]  → ffmpeg 抽帧 → Vision API → description + caption
+         [extract]     → LLM × N(memory_types) 并发 → (type, content, [cat_names])
+         [categorize]  → embed items → 写入 inmemory store → category_updates
+         [persist]     → LLM 更新 category summary（增量累积）
+         [response]    → TaskResult(items_count, elapsed)
+   → [汇总] → category .md 文件 + results.json
+
+  关键并发特性：
+  - asyncio.Semaphore 控制最大并发数，防止 API 限流
+  - asyncio.gather 内部每个 memorize 调用的 Step 3（extract_items）自身也会并发调用多个 memory_type 的 LLM
+  - inmemory store 无需加锁（asyncio 单线程，await 点之间不会被抢占）
+  - category summary 在高并发下存在后写覆盖问题：多个协程同时更新同一 category 时，最后完成的那个会覆盖之前的摘要
+
