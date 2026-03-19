@@ -15,26 +15,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import logging
 import os
 import sys
+import threading
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 src_path = os.path.abspath("src")
 sys.path.insert(0, src_path)
 
 from memu.app import MemoryService  # noqa: E402
 from memu.llm.wrapper import LLMCallContext, LLMRequestView, LLMResponseView, LLMUsage  # noqa: E402
+from memu.workflow.interceptor import WorkflowStepContext  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-llm_trace_logger = logging.getLogger("memu.llm.trace")
 
 
 # ---------------------------------------------------------------------------
@@ -69,53 +73,226 @@ class BatchStats:
 
 
 # ---------------------------------------------------------------------------
-# LLM / Embedding trace logging
+# Trace collector
 # ---------------------------------------------------------------------------
 
-def setup_llm_tracing(service: MemoryService) -> None:
-    """Register before/after/on_error interceptors to log every LLM and embedding call."""
+@dataclass
+class LLMTraceRecord:
+    file: str
+    step_id: str
+    kind: str          # chat / embed / vision / transcribe
+    profile: str
+    model: str
+    input_tokens: int | None
+    output_tokens: int | None
+    total_tokens: int | None
+    latency_ms: float | None
+    status: str        # ok / error
+    error: str | None = None
 
-    def on_before(ctx: LLMCallContext, req: LLMRequestView) -> None:
-        llm_trace_logger.info(
-            "[LLM] --> kind=%-8s step=%-20s op=%-20s profile=%-10s model=%s  in_items=%s in_chars=%s",
-            req.kind,
-            ctx.step_id or "-",
-            ctx.operation or "-",
-            ctx.profile or "-",
-            ctx.model or "-",
-            req.input_items,
-            req.input_chars,
-        )
 
-    def on_after(ctx: LLMCallContext, req: LLMRequestView, resp: LLMResponseView, usage: LLMUsage) -> None:
-        llm_trace_logger.info(
-            "[LLM] <-- kind=%-8s step=%-20s latency=%6.0fms  tokens(in=%s out=%s total=%s)  out_chars=%s",
-            req.kind,
-            ctx.step_id or "-",
-            usage.latency_ms or 0,
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.total_tokens,
-            resp.output_chars,
-        )
+@dataclass
+class StepTraceRecord:
+    file: str
+    step_id: str
+    step_role: str
+    elapsed_ms: float
+    status: str        # ok / error
+    error: str | None = None
 
-    def on_error(ctx: LLMCallContext, req: LLMRequestView, error: Exception, usage: LLMUsage) -> None:
-        llm_trace_logger.error(
-            "[LLM] ERR kind=%-8s step=%-20s latency=%6.0fms  error=%s",
-            req.kind,
-            ctx.step_id or "-",
-            usage.latency_ms or 0,
-            error,
-        )
 
-    service.intercept_before_llm_call(on_before)
-    service.intercept_after_llm_call(on_after)
-    service.intercept_on_error_llm_call(on_error)
+class TraceCollector:
+    """Thread-safe collector for workflow step and LLM call traces."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.llm_records: list[LLMTraceRecord] = []
+        self.step_records: list[StepTraceRecord] = []
+        # per-step wall-clock start times keyed by (file, step_id)
+        self._step_starts: dict[tuple[str, str], float] = {}
+        # current file being processed per asyncio task (task_id -> filename)
+        self._task_file: dict[int, str] = {}
+
+    # -- file tracking -------------------------------------------------------
+
+    def set_current_file(self, filename: str) -> None:
+        tid = id(asyncio.current_task())
+        with self._lock:
+            self._task_file[tid] = filename
+
+    def current_file(self) -> str:
+        tid = id(asyncio.current_task())
+        with self._lock:
+            return self._task_file.get(tid, "-")
+
+    def clear_current_file(self) -> None:
+        tid = id(asyncio.current_task())
+        with self._lock:
+            self._task_file.pop(tid, None)
+
+    # -- workflow step -------------------------------------------------------
+
+    def on_step_before(self, step_ctx: Any, state: Any) -> None:
+        key = (self.current_file(), step_ctx.step_id)
+        with self._lock:
+            self._step_starts[key] = time.monotonic()
+
+    def on_step_after(self, step_ctx: Any, state: Any) -> None:
+        fname = self.current_file()
+        key = (fname, step_ctx.step_id)
+        with self._lock:
+            t0 = self._step_starts.pop(key, None)
+        elapsed_ms = (time.monotonic() - t0) * 1000 if t0 else 0.0
+        with self._lock:
+            self.step_records.append(StepTraceRecord(
+                file=fname,
+                step_id=step_ctx.step_id,
+                step_role=step_ctx.step_role,
+                elapsed_ms=round(elapsed_ms, 1),
+                status="ok",
+            ))
+
+    def on_step_error(self, step_ctx: Any, state: Any, error: Exception) -> None:
+        fname = self.current_file()
+        key = (fname, step_ctx.step_id)
+        with self._lock:
+            t0 = self._step_starts.pop(key, None)
+        elapsed_ms = (time.monotonic() - t0) * 1000 if t0 else 0.0
+        with self._lock:
+            self.step_records.append(StepTraceRecord(
+                file=fname,
+                step_id=step_ctx.step_id,
+                step_role=step_ctx.step_role,
+                elapsed_ms=round(elapsed_ms, 1),
+                status="error",
+                error=str(error),
+            ))
+
+    # -- LLM calls -----------------------------------------------------------
+
+    def on_llm_after(self, ctx: Any, req: Any, resp: Any, usage: Any) -> None:
+        with self._lock:
+            self.llm_records.append(LLMTraceRecord(
+                file=self.current_file(),
+                step_id=ctx.step_id or "-",
+                kind=req.kind,
+                profile=ctx.profile or "-",
+                model=ctx.model or "-",
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                total_tokens=usage.total_tokens,
+                latency_ms=round(usage.latency_ms, 1) if usage.latency_ms else None,
+                status="ok",
+            ))
+
+    def on_llm_error(self, ctx: Any, req: Any, error: Exception, usage: Any) -> None:
+        with self._lock:
+            self.llm_records.append(LLMTraceRecord(
+                file=self.current_file(),
+                step_id=ctx.step_id or "-",
+                kind=req.kind,
+                profile=ctx.profile or "-",
+                model=ctx.model or "-",
+                input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                latency_ms=round(usage.latency_ms, 1) if usage.latency_ms else None,
+                status="error",
+                error=str(error),
+            ))
+
+
+def setup_tracing(service: MemoryService, collector: TraceCollector) -> None:
+    """Wire collector into service LLM and workflow interceptors."""
+    service.intercept_after_llm_call(collector.on_llm_after)
+    service.intercept_on_error_llm_call(collector.on_llm_error)
+    service.intercept_before_workflow_step(collector.on_step_before)
+    service.intercept_after_workflow_step(collector.on_step_after)
+    service.intercept_on_error_workflow_step(collector.on_step_error)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Report writer
 # ---------------------------------------------------------------------------
+
+def _fmt(v: Any) -> str:
+    return "" if v is None else str(v)
+
+
+def write_trace_report(
+    collector: TraceCollector,
+    output_dir: Path,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- 1. step_trace.csv ------------------------------------------------
+    step_csv = output_dir / "step_trace.csv"
+    step_fields = ["file", "step_id", "step_role", "elapsed_ms", "status", "error"]
+    with step_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=step_fields)
+        w.writeheader()
+        for r in collector.step_records:
+            w.writerow({k: _fmt(getattr(r, k)) for k in step_fields})
+
+    # ---- 2. llm_trace.csv -------------------------------------------------
+    llm_csv = output_dir / "llm_trace.csv"
+    llm_fields = ["file", "step_id", "kind", "profile", "model",
+                  "input_tokens", "output_tokens", "total_tokens", "latency_ms", "status", "error"]
+    with llm_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=llm_fields)
+        w.writeheader()
+        for r in collector.llm_records:
+            w.writerow({k: _fmt(getattr(r, k)) for k in llm_fields})
+
+    # ---- 3. step_summary.md  (per step_id aggregated) ---------------------
+    step_agg: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"count": 0, "total_ms": 0.0, "errors": 0}
+    )
+    for r in collector.step_records:
+        a = step_agg[r.step_id]
+        a["role"] = r.step_role
+        a["count"] += 1
+        a["total_ms"] += r.elapsed_ms
+        if r.status == "error":
+            a["errors"] += 1
+
+    step_md = output_dir / "step_summary.md"
+    with step_md.open("w", encoding="utf-8") as f:
+        f.write("# Workflow Step Summary\n\n")
+        f.write("| step_id | role | calls | avg_ms | total_ms | errors |\n")
+        f.write("|---------|------|------:|-------:|---------:|-------:|\n")
+        for sid, a in sorted(step_agg.items(), key=lambda x: -x[1]["total_ms"]):
+            avg = a["total_ms"] / a["count"] if a["count"] else 0
+            f.write(f"| {sid} | {a.get('role','-')} | {a['count']} "
+                    f"| {avg:.0f} | {a['total_ms']:.0f} | {a['errors']} |\n")
+
+    # ---- 4. llm_summary.md  (per step_id × kind aggregated) --------------
+    llm_agg: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+        lambda: {"count": 0, "total_ms": 0.0, "in_tok": 0, "out_tok": 0, "errors": 0}
+    )
+    for r in collector.llm_records:
+        key = (r.step_id, r.kind)
+        a = llm_agg[key]
+        a["model"] = r.model
+        a["count"] += 1
+        a["total_ms"] += r.latency_ms or 0
+        a["in_tok"] += r.input_tokens or 0
+        a["out_tok"] += r.output_tokens or 0
+        if r.status == "error":
+            a["errors"] += 1
+
+    llm_md = output_dir / "llm_summary.md"
+    with llm_md.open("w", encoding="utf-8") as f:
+        f.write("# LLM Call Summary\n\n")
+        f.write("| step_id | kind | model | calls | avg_ms | total_ms | in_tokens | out_tokens | errors |\n")
+        f.write("|---------|------|-------|------:|-------:|---------:|----------:|-----------:|-------:|\n")
+        for (sid, kind), a in sorted(llm_agg.items(), key=lambda x: -x[1]["total_ms"]):
+            avg = a["total_ms"] / a["count"] if a["count"] else 0
+            f.write(f"| {sid} | {kind} | {a.get('model','-')} | {a['count']} "
+                    f"| {avg:.0f} | {a['total_ms']:.0f} "
+                    f"| {a['in_tok']} | {a['out_tok']} | {a['errors']} |\n")
+
+    logger.info("Trace reports written: %s", output_dir)
 
 def parse_category_from_filename(mp4: Path) -> str:
     """Extract category from filename format 'xxx.category.mp4' → 'category'."""
@@ -174,9 +351,11 @@ async def process_one(
     service: MemoryService,
     task: VideoTask,
     semaphore: asyncio.Semaphore,
+    collector: TraceCollector,
 ) -> TaskResult:
     """Process a single video file under the semaphore."""
     async with semaphore:
+        collector.set_current_file(task.path.name)
         t0 = time.monotonic()
         try:
             logger.info("Processing: %s (category=%s)", task.path.name, task.category_name)
@@ -186,10 +365,7 @@ async def process_one(
             )
             items_count = len(result.get("items", []))
             elapsed = time.monotonic() - t0
-            logger.info(
-                "Done: %s — %d items in %.1fs",
-                task.path.name, items_count, elapsed,
-            )
+            logger.info("Done: %s — %d items in %.1fs", task.path.name, items_count, elapsed)
             return TaskResult(
                 path=task.path,
                 category_name=task.category_name,
@@ -207,15 +383,18 @@ async def process_one(
                 elapsed=elapsed,
                 error=str(e),
             )
+        finally:
+            collector.clear_current_file()
 
 
 async def run_batch(
     tasks: list[VideoTask],
     service: MemoryService,
     concurrency: int,
+    collector: TraceCollector,
 ) -> tuple[list[TaskResult], list[dict]]:
     semaphore = asyncio.Semaphore(concurrency)
-    coros = [process_one(service, t, semaphore) for t in tasks]
+    coros = [process_one(service, t, semaphore, collector) for t in tasks]
     results: list[TaskResult] = await asyncio.gather(*coros)
 
     # Collect final category state from service store
@@ -261,12 +440,13 @@ async def main(video_dir: Path, concurrency: int, output_dir: Path) -> None:
         memorize_config={"memory_categories": unique_categories},
     )
 
-    # 4. Setup LLM tracing
-    setup_llm_tracing(service)
+    # 4. Setup tracing
+    collector = TraceCollector()
+    setup_tracing(service, collector)
 
     # 5. Run batch
     t0 = time.monotonic()
-    results, categories = await run_batch(tasks, service, concurrency)
+    results, categories = await run_batch(tasks, service, concurrency, collector)
     total_elapsed = time.monotonic() - t0
 
     # 5. Compute stats
@@ -284,6 +464,9 @@ async def main(video_dir: Path, concurrency: int, output_dir: Path) -> None:
 
     # 6. Write output
     write_category_md(categories, output_dir)
+
+    # 7. Write trace reports
+    write_trace_report(collector, output_dir)
 
     # 7. Write per-file result summary
     summary_path = output_dir / "results.json"
