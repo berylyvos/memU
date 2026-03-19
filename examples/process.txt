@@ -1,0 +1,185 @@
+                                     
+  ---                                                                                                                                                                                 
+  example_3_multimodal_memory.py 全流程拆解                                                                                                                                           
+                                                                                                                                                                                      
+  一、顶层流程                                                                                                                                                                        
+                                                                                                                                                                                      
+  main()          
+  ├── 1. 初始化 MemoryService
+  ├── 2. 循环处理 3 个资源 (doc1.txt, doc2.txt, image1.png)
+  │   └── service.memorize(resource_url, modality)  ← 核心
+  └── 3. 将 categories 写成 .md 文件
+
+  ---
+  二、MemoryService 初始化
+                                                                                                                                                                                      
+  service.py:50
+                                                                                                                                                                                      
+  MemoryService.__init__()
+  ├── 验证并存储各 config (llm_profiles, memorize_config 等)
+  ├── 构建 category_configs (5个自定义分类)
+  ├── _format_categories_for_prompt() → _category_prompt_str (给 LLM 用的分类描述字符串)
+  ├── Context(categories_ready=False)  ← 分类尚未初始化
+  ├── build_database() → inmemory Database
+  └── _register_pipelines()
+      └── 注册 "memorize" workflow (7个 WorkflowStep)                                                                                                                                 
+                                                                                                                                                                                      
+  ---                                                                                                                                                                                 
+  三、service.memorize() 内部详细流程                                                                                                                                                 
+                  
+  memorize.py:65
+
+  阶段 0：前置准备
+
+  memorize()
+  ├── _ensure_categories_ready()          ← 首次调用时执行
+  │   └── _initialize_categories()                                                                                                                                                    
+  │       ├── 对每个 CategoryConfig 生成 embedding text ("technical_documentation: ...")
+  │       ├── llm_client("embedding").embed([5个文本])  → 5个向量                                                                                                                     
+  │       └── store.memory_category_repo.get_or_create_category()  × 5
+  │           → ctx.category_ids = [id1..id5]                                                                                                                                         
+  │           → ctx.category_name_to_id = {"technical_documentation": id1, ...}
+  │           → ctx.categories_ready = True                                                                                                                                           
+  │                                                                                                                                                                                   
+  └── _run_workflow("memorize", initial_state)
+      └── 依次执行 7 个 WorkflowStep                                                                                                                                                  
+                  
+  ---
+  Step 1: ingest_resource (io)
+                                                                                                                                                                                      
+  _memorize_ingest_resource()
+  └── fs.fetch(resource_url, modality)                                                                                                                                                
+      ├── document → 读取文件文本，返回 (local_path, raw_text)
+      └── image    → 返回 (local_path, raw_text=None)
+
+  state += {local_path, raw_text}
+
+  ---
+  Step 2: preprocess_multimodal (llm)
+
+  _memorize_preprocess_multimodal()
+  └── _preprocess_resource_url(local_path, text, modality, llm_client)
+      ├── 查找 preprocess prompt template (PREPROCESS_PROMPTS[modality])
+      │
+      ├── [document 分支]
+      │   └── _preprocess_document(text, template)
+      │       ├── prompt = template.format(document_text=text)
+      │       ├── llm_client.chat(prompt)  → LLM 返回 XML
+      │       └── _parse_multimodal_response(raw, "processed_content", "caption")
+      │           → (condensed_text, caption)                                                                                                                                         
+      │
+      └── [image 分支]                                                                                                                                                                
+          └── _preprocess_image(local_path, template)
+              ├── llm_client.vision(prompt=template, image_path=local_path)
+              │   → Vision API 分析图片
+              └── _parse_multimodal_response(raw, "detailed_description", "caption")
+                  → (description_text, caption)
+
+  state["preprocessed_resources"] = [{"text": ..., "caption": ...}]
+
+  ---
+  Step 3: extract_items (llm)
+
+  _memorize_extract_items()
+  └── 对每个 preprocessed_resource:
+      └── _generate_structured_entries(resource_url, modality, memory_types, text, categories_prompt_str)
+          └── _generate_text_entries()                                                                                                                                                
+              └── _generate_entries_from_text()
+                  ├── 对每个 memory_type (knowledge/profile/behavior/event/skill 等)                                                                                                  
+                  │   └── _build_memory_type_prompt(memory_type, resource_text, categories_str)                                                                                       
+                  │       → 填充 MEMORY_TYPE_PROMPTS[mtype] 模板
+                  │                                                                                                                                                                   
+                  ├── asyncio.gather(*[llm_client.chat(prompt) for prompt in prompts])
+                  │   → 并发调用 LLM，每种 memory_type 一次
+                  │
+                  └── _parse_structured_entries(memory_types, responses)
+                      └── 对每个响应:
+                          └── _parse_memory_type_response_xml(raw)
+                              → 解析 XML: <knowledge><memory><content>...</content>
+                                                                <categories><category>...</category>
+                              → list[{content, categories}]
+                          → entries: [(MemoryType, "content text", ["category_name", ...])]
+
+  state["resource_plans"] = [{resource_url, text, caption, entries: [...]}]
+
+  ---
+  Step 4: dedupe_merge
+                                                                                                                                                                                      
+  _memorize_dedupe_merge()
+  └── 当前为 placeholder，直接透传 resource_plans                                                                                                                                     
+                  
+  ---
+  Step 5: categorize_items (db + vector)
+
+  _memorize_categorize_items()
+  └── 对每个 resource_plan:
+      ├── _create_resource_with_caption()
+      │   ├── embed_client.embed([caption])  → caption_embedding
+      │   └── store.resource_repo.create_resource(url, modality, local_path, caption, embedding)
+      │
+      └── _persist_memory_items(resource_id, entries, ctx, store, embed_client)
+          ├── embed_client.embed([content for _, content, _ in entries])                                                                                                              
+          │   → 批量生成所有 memory item 的向量
+          │                                                                                                                                                                           
+          └── 对每个 (memory_type, summary_text, cat_names):
+              ├── store.memory_item_repo.create_item(resource_id, memory_type, summary, embedding)
+              ├── _map_category_names_to_ids(cat_names, ctx)
+              │   → 将 LLM 返回的分类名映射到 category_id
+              └── store.category_item_repo.link_item_category(item.id, cid)
+                  → category_updates[cid].append((item_id, summary_text))
+
+  state += {resources, items, relations, category_updates}
+
+  ---
+  Step 6: persist_index (db + llm)
+
+  _memorize_persist_and_index()
+  └── _update_category_summaries(category_updates, ctx, store, llm_client)
+      ├── 对每个有更新的 category:
+      │   └── _build_category_summary_prompt(category, new_memories)
+      │       → 填充 CATEGORY_SUMMARY_PROMPT:
+      │         "已有摘要: {original_content}
+      │          新增记忆: {new_memory_items_text}
+      │          请更新摘要..."
+      │
+      ├── asyncio.gather(*[llm_client.chat(prompt) for ...])
+      │   → 并发更新所有受影响分类的摘要
+      │                                                                                                                                                                               
+      └── store.memory_category_repo.update_category(cid, summary=cleaned_summary)
+          → 持久化更新后的摘要文本                                                                                                                                                    
+                  
+  ---
+  Step 7: build_response (emit)
+
+  _memorize_build_response()
+  └── 从 store 读取所有 category_ids 对应的 MemoryCategory 对象
+      → response = {
+          "resource": {...},
+          "items": [...],
+          "categories": [
+              {name, description, summary, ...},  ← 包含刚更新的 summary
+              ...
+          ],
+          "relations": [...]
+        }
+
+  ---
+  四、跨资源累积效果
+
+  3 个资源依次处理，每次 memorize() 调用后：
+  - categories_ready=True，跳过初始化
+  - 新 items 追加到同一批 category 下
+  - Step 6 每次都会用 LLM 增量更新 category summary（原有摘要 + 新 items → 新摘要）
+
+  最终 result["categories"] 返回的是所有资源处理完后的累积摘要状态。
+
+  ---
+  五、数据流总结
+
+  文件
+   → [ingest] raw_text / local_path                                                                                                                                                   
+   → [preprocess] LLM/Vision → condensed text + caption
+   → [extract] LLM × N(memory_types) → (type, content, [category_names])                                                                                                              
+   → [categorize] embed → MemoryItem + CategoryItem (关联关系)
+   → [persist] LLM → 更新 MemoryCategory.summary
+   → [response] 序列化返回
